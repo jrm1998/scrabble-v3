@@ -1,0 +1,68 @@
+CREATE DATABASE IF NOT EXISTS scrabble CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE scrabble;
+
+CREATE TABLE IF NOT EXISTS users (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(16) NOT NULL UNIQUE,
+  password_hash VARCHAR(100) NOT NULL,
+  rating INT NOT NULL DEFAULT 1200,
+  games_played INT NOT NULL DEFAULT 0,
+  wins INT NOT NULL DEFAULT 0,
+  losses INT NOT NULL DEFAULT 0,
+  draws INT NOT NULL DEFAULT 0,
+  best_word VARCHAR(15) NULL,
+  best_word_score INT NOT NULL DEFAULT 0,
+  coins INT NOT NULL DEFAULT 100,
+  avatar VARCHAR(16) NOT NULL DEFAULT '🙂',
+  bio VARCHAR(160) NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_rating (rating)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS games (
+  id VARCHAR(16) PRIMARY KEY,
+  code VARCHAR(8) NOT NULL,
+  mode ENUM('private','ai','ranked') NOT NULL,
+  ranked TINYINT(1) NOT NULL DEFAULT 0,
+  reason VARCHAR(16) NOT NULL,
+  winner_uid VARCHAR(40) NULL,
+  started_at DATETIME NOT NULL,
+  ended_at DATETIME NOT NULL,
+  moves JSON NOT NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS game_players (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  game_id VARCHAR(16) NOT NULL,
+  uid VARCHAR(40) NOT NULL,
+  user_id INT UNSIGNED NULL,
+  name VARCHAR(32) NOT NULL,
+  is_ai TINYINT(1) NOT NULL DEFAULT 0,
+  score INT NOT NULL,
+  result ENUM('win','loss','draw') NOT NULL,
+  rating_before INT NULL,
+  rating_after INT NULL,
+  FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+  INDEX idx_user (user_id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS messages (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  scope VARCHAR(20) NOT NULL,            -- 'lobby' or 'game:<id>'
+  uid VARCHAR(40) NOT NULL,
+  name VARCHAR(32) NOT NULL,
+  text VARCHAR(300) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_scope (scope, id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  user_id INT UNSIGNED NOT NULL,
+  endpoint_hash CHAR(64) NOT NULL UNIQUE,
+  endpoint TEXT NOT NULL,
+  p256dh VARCHAR(255) NOT NULL,
+  auth VARCHAR(255) NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;

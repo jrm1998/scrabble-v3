@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14532d">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="stylesheet" href="/style.css">
+<title>Scrabble Online</title>
+</head>
+<body>
+<header>
+  <h1>🔤 Scrabble</h1>
+  <div class="spacer"></div>
+  <span id="offline" hidden>Offline</span>
+  <button id="installBtn" class="small" hidden>Install app</button>
+  <button id="pushBtn" class="small" hidden>🔔 Notifications</button>
+  <span id="whoami"></span>
+  <button id="logoutBtn" class="small" hidden>Sign out</button>
+</header>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<main id="auth" hidden>
+  <section class="card narrow">
+    <h2>Welcome</h2>
+    <label>Username <input id="authUser" maxlength="16" autocomplete="username"></label>
+    <label>Password <input id="authPass" type="password" maxlength="72" autocomplete="current-password"></label>
+    <div class="row">
+      <button id="loginBtn">Sign in</button>
+      <button id="registerBtn" class="secondary">Create account</button>
+    </div>
+    <hr>
+    <button id="guestBtn" class="secondary wide">Play as guest</button>
+    <p class="muted">Guests can play AI games and private rooms. Sign in for ranked play, rating, profile and leaderboard.</p>
+  </section>
+</main>
+
+<main id="lobby" hidden>
+  <div class="grid">
+    <section class="card">
+      <h2>Play</h2>
+      <h3>Vs. robot</h3>
+      <div class="row">
+        <select id="aiLevel"><option value="easy">Easy</option><option value="medium" selected>Medium</option><option value="hard">Hard</option></select>
+        <button id="aiBtn">Start</button>
+      </div>
+      <h3>Ranked</h3>
+      <div class="row"><button id="queueBtn">Find ranked match</button><span id="queueMsg" class="muted"></span></div>
+      <h3>Private room</h3>
+      <div class="row">
+        <select id="roomPlayers"><option value="2">2 players</option><option value="3">3 players</option><option value="4">4 players</option></select>
+        <select id="roomTimer"><option value="60">60s turns</option><option value="90" selected>90s turns</option><option value="180">180s turns</option></select>
+        <button id="createBtn">Create</button>
+      </div>
+      <div class="row">
+        <input id="joinCode" placeholder="Room code" maxlength="5" autocapitalize="characters">
+        <button id="joinBtn">Join</button>
+        <button id="watchBtn" class="secondary">Watch</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>My profile</h2>
+      <div id="profileBox" class="muted">Sign in to see your stats.</div>
+    </section>
+    <section class="card">
+      <h2>Leaderboard</h2>
+      <table id="leaderboard"><thead><tr><th>#</th><th>Player</th><th>Rating</th><th>W/G</th></tr></thead><tbody></tbody></table>
+    </section>
+    <section class="card chat">
+      <h2>Lobby chat</h2>
+      <div id="lobbyChat" class="chatlog"></div>
+      <form id="lobbyChatForm" class="row"><input id="lobbyChatInput" maxlength="300" placeholder="Say hi…" autocomplete="off"><button>Send</button></form>
+    </section>
+  </div>
+</main>
+
+<main id="game" hidden>
+  <div class="gamebar">
+    <span>Room <b id="roomCode"></b></span>
+    <span id="gameStatus"></span>
+    <span id="timer"></span>
+    <div class="spacer"></div>
+    <button id="leaveBtn" class="secondary small">Leave</button>
+  </div>
+  <div class="gamegrid">
+    <div class="left">
+      <div id="board" aria-label="Scrabble board"></div>
+      <div id="rack"></div>
+      <div id="controls" class="row">
+        <button id="submitBtn">Play</button>
+        <button id="recallBtn" class="secondary">Recall</button>
+        <button id="shuffleBtn" class="secondary">Shuffle</button>
+        <button id="exchangeBtn" class="secondary">Exchange</button>
+        <button id="passBtn" class="secondary">Pass</button>
+        <button id="hintBtn" class="secondary">Hint</button>
+        <button id="resignBtn" class="danger">Resign</button>
+      </div>
+      <div id="hintBox" class="muted"></div>
+    </div>
+    <div class="right">
+      <section class="card" id="waitCard" hidden>
+        <h3>Waiting for players</h3>
+        <p>Share this code: <b class="big" id="waitCode"></b></p>
+        <button id="startBtn">Start game</button>
+      </section>
+      <section class="card"><h3>Players</h3><ul id="players"></ul><div class="muted">Tiles in bag: <span id="bagCount"></span></div></section>
+      <section class="card" id="voiceCard" hidden>
+        <h3>🎧 Voice chat</h3>
+        <div class="row">
+          <label class="switch"><input type="checkbox" id="voiceToggle"><span>Enable voice chat</span></label>
+          <button id="micBtn" class="secondary" disabled aria-pressed="false" title="Mute / unmute (M)">🎙️ Mic off</button>
+        </div>
+        <div id="voiceStatus" class="vstatus muted" role="status" aria-live="polite">Voice chat is off.</div>
+        <ul id="voicePeers" class="vpeers"></ul>
+        <div id="voiceAudio" hidden></div>
+      </section>
+      <section class="card" id="resultCard" hidden></section>
+      <section class="card"><h3>Word trivia</h3><div id="trivia" class="trivia"></div></section>
+      <section class="card"><h3>Moves</h3><ol id="moves" reversed></ol></section>
+      <section class="card chat">
+        <h3>Chat</h3>
+        <div id="gameChat" class="chatlog"></div>
+        <form id="gameChatForm" class="row"><input id="gameChatInput" maxlength="300" placeholder="Message…" autocomplete="off"><button>Send</button></form>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/app.js"></script>
+<script src="/voice.js"></script>
+</body>
+</html>

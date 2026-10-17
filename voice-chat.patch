@@ -1,0 +1,588 @@
+diff -ruN a/.env.example b/.env.example
+--- a/.env.example	2026-10-17 12:01:16.990821138 +0000
++++ b/.env.example	2026-10-17 12:02:46.813254108 +0000
+@@ -22,3 +22,10 @@
+ DEFINITION_SOURCES=dictionaryapi,wiktionary,datamuse
+ # Retry delays (ms) for definitions that could not be fetched the first time
+ TRIVIA_RETRY_MS=15000,45000
++# Voice chat (WebRTC). Defaults to public Google STUN, which is enough for most home networks.
++# Players behind strict NATs/mobile data need a TURN server (e.g. coturn with use-auth-secret):
++#VOICE_STUN_URLS=stun:stun.l.google.com:19302
++#VOICE_TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
++#VOICE_TURN_SECRET=
++# Or give the complete ICE server list as JSON (overrides the three settings above):
++#VOICE_ICE_SERVERS=[{"urls":"stun:stun.example.com:3478"}]
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-10-17 12:01:16.992263550 +0000
++++ b/README.md	2026-10-17 12:12:23.971548659 +0000
+@@ -33,6 +33,7 @@
+ | 9 | Push notifications when it is your turn and you are offline | `web-push`, `sw.js` |
+ | 10 | AI opponent (easy / medium / hard) + hints | `src/ai.js` |
+ | + | **Word trivia for every played word** (definition, example, origin, similar words + fun facts), shown in a card | `src/trivia.js`, `trivia:new` |
++| + | **Real-time voice chat** (WebRTC audio, Socket.IO signaling, mute/enable toggles, per-player mic status) | `public/voice.js`, `voice:*` events |
+ | + | Turn timer (auto-pass; 3 timeouts = forfeit), game history + move log stored as JSON (replay-ready) | `src/game.js`, `games.moves` |
+ 
+ ### Not built yet (roadmap)
+@@ -50,6 +51,32 @@
+   accept some words Scrabble does not (hyphenated or proper-noun-like entries are filtered by the A–Z rule, but others slip through).
+   That is why `hybrid` plus the full ENABLE list (`npm run dict`) is recommended. The AI and hints always use the local list.
+ 
++## Voice chat
++Players in the same room can talk to each other while they play. Audio goes **directly between browsers** (WebRTC, one connection per pair of players, so 2-4 players);
++the server only relays the connection set-up messages over Socket.IO and never touches the audio.
++
++**Using it:** in a room, open the **Voice chat** card and switch on *Enable voice chat*. The browser asks for microphone permission.
++The 🎙️ button (or the **M** key) mutes and unmutes. Each player shows 🎙️ microphone on, 🔇 muted, or 🚫 voice chat disabled, a green ring appears around whoever is speaking,
++and the card shows the connection status to every other player. Voice chat is **off by default** and is switched off again when you leave the room or start another game.
++No microphone or permission denied? You join in *listen-only* mode and get a clear message explaining why.
++
++**Security:** the server checks on every voice event that the sender is a *player* in the room (spectators and outsiders are refused), that the target is in the same room's voice session,
++and that the signal is a well-formed, size-limited offer/answer/candidate (flooding is rate limited). A player has one voice session at a time (a second tab replaces the first),
++and sessions end automatically on leaving the room, disconnecting, or the room closing.
++
++**Settings (`.env`, all optional):** `VOICE_STUN_URLS`, `VOICE_TURN_URLS` + `VOICE_TURN_SECRET` (coturn with `use-auth-secret`; the server hands out short-lived credentials) or `VOICE_ICE_SERVERS` (JSON).
++The default is public Google STUN, which works for most home networks. Players on mobile data or strict corporate networks usually need a TURN server.
++
++**Testing it:**
++1. `npm start`, open `http://localhost:3000` in **two different browsers** (or one normal and one private window) and sign in / play as guest in each.
++2. Browser 1: create a private room. Browser 2: join with the code. Start the game.
++3. In **both** windows: *Enable voice chat*, allow the microphone. Use headphones, or you will get feedback from your own speakers.
++4. Speak: the other window shows the green speaking ring and you hear each other. Test mute (🎙️ / **M**), the enable toggle, and leaving the room.
++5. Other devices: browsers only allow microphones on **HTTPS or localhost**, so for phones or another PC serve the game over HTTPS (for example with a Cloudflare Tunnel or ngrok) and open that address.
++6. Deny the microphone permission once to see the listen-only message. Open the game as a spectator to confirm spectators cannot join voice.
++
++**Privacy note:** with peer-to-peer WebRTC, the other players' browsers can see your public IP address (inherent to the technology). Use a TURN relay if that matters to you.
++
+ ## Word trivia
+ After every move (human or robot) the server looks up each word formed and sends a trivia card to everyone in the room, including spectators.
+ It shows the definition, example sentence, pronunciation, origin and similar words from the same API as the word checker (inflected words such as
+@@ -72,7 +99,7 @@
+ src/trivia.js     Builds the trivia card for a played word
+ src/dictionary.js Word set + trie (AI + fallback)           src/elo.js  Rating maths
+ src/db.js         MySQL access (parameterised queries only)     schema.sql  Tables
+-public/           Vanilla JS client, service worker, manifest
++public/           Vanilla JS client (app.js game UI, voice.js voice chat), service worker, manifest
+ tests/run.js      Unit tests, AI-vs-brute-force check, full AI-vs-AI games
+ ```
+ 
+diff -ruN a/public/app.js b/public/app.js
+--- a/public/app.js	2026-10-17 12:01:16.990054605 +0000
++++ b/public/app.js	2026-10-17 12:03:24.828715556 +0000
+@@ -61,6 +61,7 @@
+   await boot();
+ }
+ function logout() {
++  if (window.Voice) Voice.reset();
+   token = null; me = null; G = null; store('scrabble_token', null);
+   if (socket) { socket.disconnect(); socket = null; }
+   $('whoami').textContent = ''; $('logoutBtn').hidden = true; $('pushBtn').hidden = true;
+@@ -117,7 +118,7 @@
+   socket = io({ auth: { token } });
+   socket.on('connect_error', (e) => { if (e.message === 'unauthorized') { toast('Session expired, please sign in again'); logout(); } });
+   socket.on('game:state', onState);
+-  socket.on('room:left', () => { G = null; lastGameId = null; $('gameChat').replaceChildren(); trivia = []; renderTrivia(); resetInput(); show('lobby'); setTimeout(async () => { try { me = await api('/api/me'); } catch (_) {} refreshLobby(); }, 800); });
++  socket.on('room:left', () => { if (window.Voice) Voice.reset(); G = null; lastGameId = null; $('gameChat').replaceChildren(); trivia = []; renderTrivia(); resetInput(); show('lobby'); setTimeout(async () => { try { me = await api('/api/me'); } catch (_) {} refreshLobby(); }, 800); });
+   socket.on('queue:status', (s) => { searching = s.searching; renderQueue(); });
+   socket.on('chat:msg', (m) => addChat(m.scope, m));
+   socket.on('chat:history', (d) => { const box = d.scope === 'lobby' ? $('lobbyChat') : $('gameChat'); box.replaceChildren(); d.messages.forEach(m => addChat(d.scope, m)); });
+@@ -125,6 +126,7 @@
+   socket.on('trivia:new', (rec) => { trivia.unshift(rec); trivia.sort((a, b) => b.n - a.n); trivia = trivia.slice(0, 30); renderTrivia(); });
+   socket.on('trivia:update', (rec) => { trivia = trivia.map(r => (r.n === rec.n ? rec : r)); renderTrivia(); });
+   socket.on('trivia:history', (list) => { trivia = [...list].sort((a, b) => b.n - a.n); renderTrivia(); });
++  if (window.Voice) Voice.attach(socket);
+ }
+ const SOURCE_LABEL = { dictionaryapi: 'Free Dictionary API', wiktionary: 'Wiktionary (CC BY-SA)', datamuse: 'Datamuse / WordNet' };
+ function triviaWord(t) {
+@@ -154,7 +156,7 @@
+ function resetInput() { pending.clear(); selected = null; exchangeMode = false; exchangeSel.clear(); $('hintBox').replaceChildren(); }
+ function onState(s) {
+   const n = s.history.length ? s.history[s.history.length - 1].n : 0;
+-  if (s.id !== lastGameId) { lastGameId = s.id; lastN = -1; $('gameChat').replaceChildren(); trivia = []; renderTrivia(); resetInput(); }
++  if (s.id !== lastGameId) { if (window.Voice) Voice.reset(); lastGameId = s.id; lastN = -1; $('gameChat').replaceChildren(); trivia = []; renderTrivia(); resetInput(); }
+   if (n !== lastN) { lastN = n; resetInput(); }
+   G = s;
+   timerEnd = Date.now() + s.remainingMs;
+@@ -162,6 +164,12 @@
+   show('game');
+   render();
+ }
++const MIC = { live: ['🎙️', 'Microphone on'], muted: ['🔇', 'Muted'], off: ['🚫', 'Voice chat disabled'] };
++function micBadge(p) {
++  if (p.isAI) return null;
++  const s = (G.voice && G.voice[p.uid]) || 'off';
++  return h('span', { class: 'mic ' + s, title: MIC[s][1], 'aria-label': MIC[s][1] }, MIC[s][0]);
++}
+ const nameOf = (uid) => (G.players.find(p => p.uid === uid) || {}).name || '?';
+ const myTurn = () => G && G.status === 'playing' && G.turnUid === me.uid;
+ 
+@@ -214,8 +222,8 @@
+   $('bagCount').textContent = G.bagCount;
+ 
+   const pl = $('players'); pl.replaceChildren();
+-  for (const p of G.players) pl.append(h('li', { class: (p.uid === G.turnUid ? 'turn ' : '') + (p.active ? '' : 'out') },
+-    h('span', {}, `${p.isAI ? '🤖 ' : ''}${p.name}${p.uid === me.uid ? ' (you)' : ''}${p.rating && !p.isAI ? ' · ' + p.rating : ''}`),
++  for (const p of G.players) pl.append(h('li', { 'data-uid': p.uid, class: (p.uid === G.turnUid ? 'turn ' : '') + (p.active ? '' : 'out') },
++    h('span', {}, micBadge(p), ' ', `${p.isAI ? '🤖 ' : ''}${p.name}${p.uid === me.uid ? ' (you)' : ''}${p.rating && !p.isAI ? ' · ' + p.rating : ''}`),
+     h('b', {}, p.score)));
+ 
+   const mv = $('moves'); mv.replaceChildren();
+@@ -231,6 +239,7 @@
+       h('p', { class: 'muted' }, G.result.reason === 'forfeit' ? 'Won by forfeit' : G.result.reason === 'stalemate' ? 'Game ended after consecutive passes' : 'Tiles ran out (leftover tiles subtracted)'),
+       h('button', { onclick: () => act('room:leave') }, 'Back to lobby'));
+   }
++  if (window.Voice) Voice.onState();
+ }
+ 
+ function onRackClick(i) {
+diff -ruN a/public/index.html b/public/index.html
+--- a/public/index.html	2026-10-17 12:01:16.988301434 +0000
++++ b/public/index.html	2026-10-17 12:03:24.826892870 +0000
+@@ -106,6 +106,16 @@
+         <button id="startBtn">Start game</button>
+       </section>
+       <section class="card"><h3>Players</h3><ul id="players"></ul><div class="muted">Tiles in bag: <span id="bagCount"></span></div></section>
++      <section class="card" id="voiceCard" hidden>
++        <h3>🎧 Voice chat</h3>
++        <div class="row">
++          <label class="switch"><input type="checkbox" id="voiceToggle"><span>Enable voice chat</span></label>
++          <button id="micBtn" class="secondary" disabled aria-pressed="false" title="Mute / unmute (M)">🎙️ Mic off</button>
++        </div>
++        <div id="voiceStatus" class="vstatus muted" role="status" aria-live="polite">Voice chat is off.</div>
++        <ul id="voicePeers" class="vpeers"></ul>
++        <div id="voiceAudio" hidden></div>
++      </section>
+       <section class="card" id="resultCard" hidden></section>
+       <section class="card"><h3>Word trivia</h3><div id="trivia" class="trivia"></div></section>
+       <section class="card"><h3>Moves</h3><ol id="moves" reversed></ol></section>
+@@ -120,5 +130,6 @@
+ 
+ <script src="/socket.io/socket.io.js"></script>
+ <script src="/app.js"></script>
++<script src="/voice.js"></script>
+ </body>
+ </html>
+diff -ruN a/public/style.css b/public/style.css
+--- a/public/style.css	2026-10-17 12:01:16.988673049 +0000
++++ b/public/style.css	2026-10-17 12:03:24.826892870 +0000
+@@ -52,3 +52,13 @@
+ .trec{border-top:1px solid var(--line);padding:.4rem 0}.trec:first-child{border-top:0}
+ .tw{margin:.3rem 0}.tw b{color:var(--accent);letter-spacing:.05em}.tw .muted{font-size:.82rem}
+ .facts{margin:.2rem 0 0;padding-left:1.1rem;color:var(--muted);font-size:.82rem}
++
++.switch{display:flex;align-items:center;gap:.5rem;margin:0;color:var(--ink);cursor:pointer;font-size:.95rem}
++.row .switch input{flex:none;width:1.1rem;height:1.1rem;accent-color:var(--accent)}
++#micBtn.muted-on{background:#9b2c2c;color:#fff}
++.vstatus{margin:.5rem 0;font-size:.88rem}.vstatus.ok{color:#5dd39e}.vstatus.warn{color:var(--accent)}.vstatus.err{color:#ff6b6b}
++.vpeers{list-style:none;margin:0;padding:0;font-size:.9rem}.vpeers li{display:flex;gap:.5rem;align-items:center;padding:.25rem 0}
++.vpeers .link{margin-left:auto;font-size:.8rem;color:var(--muted)}
++.dot{width:.6rem;height:.6rem;border-radius:50%;background:#777;display:inline-block;font-style:normal}.dot.connected{background:#5dd39e}.dot.connecting{background:var(--accent)}.dot.failed{background:#ff6b6b}
++.mic{display:inline-block;min-width:1.4em;text-align:center}.mic.off{opacity:.45}.mic.muted{opacity:.8}
++#players li.speaking{box-shadow:0 0 0 2px #5dd39e}
+diff -ruN a/public/sw.js b/public/sw.js
+--- a/public/sw.js	2026-10-17 12:01:16.989723323 +0000
++++ b/public/sw.js	2026-10-17 12:02:46.813645977 +0000
+@@ -1,6 +1,6 @@
+ 'use strict';
+-const CACHE = 'scrabble-v1';
+-const SHELL = ['/', '/app.js', '/style.css', '/manifest.json', '/icon-192.png', '/icon-512.png'];
++const CACHE = 'scrabble-v2';
++const SHELL = ['/', '/app.js', '/voice.js', '/style.css', '/manifest.json', '/icon-192.png', '/icon-512.png'];
+ 
+ self.addEventListener('install', (e) => {
+   e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+diff -ruN a/public/voice.js b/public/voice.js
+--- a/public/voice.js	1970-01-01 00:00:00.000000000 +0000
++++ b/public/voice.js	2026-10-17 12:03:24.810846151 +0000
+@@ -0,0 +1,242 @@
++'use strict';
++/*
++ * Real-time voice chat: a WebRTC mesh (one RTCPeerConnection per other player in the room),
++ * with Socket.IO as the signaling channel. Audio never passes through the server.
++ * Uses globals from app.js: G (game state), me, socket, send, api, toast, h.
++ *
++ * Joining rule: the player who joins the voice chat makes the offers to everyone already in it,
++ * so two players never offer to each other at the same time.
++ */
++const Voice = (() => {
++  const el = (id) => document.getElementById(id);
++  const st = { on: false, joining: false, noMic: false, muted: false, note: '', stream: null, ice: [], peers: new Map(), ctx: null, speaking: new Set(), stopLocal: null };
++  const SPEAK_LEVEL = 12;   // 0-128 amplitude that counts as "speaking"
++
++  function micError(e) {
++    switch (e && e.name) {
++      case 'NotAllowedError': case 'PermissionDeniedError': return 'Microphone permission was denied. Allow it in your browser settings to talk. You can still listen.';
++      case 'NotFoundError': case 'DevicesNotFoundError': return 'No microphone was found. You can still listen.';
++      case 'NotReadableError': case 'TrackStartError': return 'Your microphone is being used by another app or is unavailable. You can still listen.';
++      case 'OverconstrainedError': return 'Your microphone does not support the requested audio settings. You can still listen.';
++      case 'SecurityError': return 'Browsers only allow microphones on secure pages (HTTPS or localhost). You can still listen.';
++      default: return 'Could not start the microphone. You can still listen.';
++    }
++  }
++
++  // ---------- UI ----------
++  function ui() {
++    const inGame = !!(G && G.you);
++    el('voiceCard').hidden = !inGame;
++    const toggle = el('voiceToggle');
++    toggle.checked = st.on || st.joining; toggle.disabled = st.joining;
++    const mic = el('micBtn');
++    mic.disabled = !st.on || st.noMic;
++    mic.textContent = !st.on ? '🎙️ Mic off' : st.noMic ? '🚫 No mic' : st.muted ? '🔇 Unmute' : '🎙️ Mute';
++    mic.setAttribute('aria-pressed', String(st.on && !st.noMic && st.muted));
++    mic.classList.toggle('muted-on', st.on && !st.noMic && st.muted);
++
++    const others = inGame ? G.players.filter(p => !p.isAI && p.uid !== me.uid) : [];
++    const inVoice = others.filter(p => G.voice && G.voice[p.uid]);
++    const linked = inVoice.filter(p => (st.peers.get(p.uid) || {}).state === 'connected').length;
++    const broken = inVoice.some(p => ['failed', 'closed'].includes((st.peers.get(p.uid) || {}).state));
++    let text, kind = 'muted';
++    if (st.joining) { text = 'Connecting…'; kind = 'warn'; }
++    else if (!st.on) text = 'Voice chat is off. Turn it on to talk with the other players in this room.';
++    else {
++      text = st.noMic ? 'Listening only (no microphone).' : st.muted ? 'You are muted: nobody can hear you.' : 'Your microphone is live: the others can hear you.';
++      if (!inVoice.length) text += ' Waiting for other players to turn voice chat on.';
++      else { text += ` Connected to ${linked} of ${inVoice.length} player${inVoice.length > 1 ? 's' : ''}.`; kind = broken ? 'err' : linked === inVoice.length ? 'ok' : 'warn'; }
++    }
++    if (st.note) { text += ' ' + st.note; if (kind !== 'err') kind = 'warn'; }
++    const s = el('voiceStatus'); s.textContent = text; s.className = 'vstatus ' + kind;
++
++    const list = el('voicePeers'); list.replaceChildren();
++    for (const p of others) {
++      const vs = (G.voice && G.voice[p.uid]) || 'off';
++      const link = (st.peers.get(p.uid) || {}).state;
++      const linkText = !st.on || vs === 'off' ? '' : link === 'connected' ? 'connected' : link === 'failed' || link === 'closed' ? 'connection problem' : link === 'disconnected' ? 'reconnecting…' : 'connecting…';
++      list.append(h('li', {},
++        h('span', { class: 'mic ' + vs, title: vs === 'off' ? 'Voice chat disabled' : vs === 'muted' ? 'Muted' : 'Microphone on' }, vs === 'live' ? '🎙️' : vs === 'muted' ? '🔇' : '🚫'),
++        h('span', {}, p.name),
++        h('span', { class: 'link' }, linkText ? [h('i', { class: 'dot ' + (link === 'connected' ? 'connected' : link === 'failed' || link === 'closed' ? 'failed' : 'connecting') }), ' ' + linkText] : (vs === 'off' ? 'voice off' : ''))));
++    }
++    if (!others.length && inGame) list.append(h('li', { class: 'muted' }, 'No other human players in this room.'));
++  }
++  function applySpeaking() {
++    document.querySelectorAll('#players li[data-uid]').forEach(li => li.classList.toggle('speaking', st.speaking.has(li.dataset.uid)));
++  }
++  const mark = (uid, on) => { on ? st.speaking.add(uid) : st.speaking.delete(uid); applySpeaking(); };
++
++  // Voice-activity detector: highlights whoever is talking (analysis only, never routed to the speakers).
++  function watch(stream, uid) {
++    try {
++      st.ctx = st.ctx || new (window.AudioContext || window.webkitAudioContext)();
++      if (st.ctx.state === 'suspended') st.ctx.resume().catch(() => {});
++      const src = st.ctx.createMediaStreamSource(stream), an = st.ctx.createAnalyser();
++      an.fftSize = 512; src.connect(an);
++      const buf = new Uint8Array(an.fftSize);
++      let on = false;
++      const id = setInterval(() => {
++        an.getByteTimeDomainData(buf);
++        let max = 0; for (const x of buf) max = Math.max(max, Math.abs(x - 128));
++        const speaking = max > SPEAK_LEVEL;
++        if (speaking !== on) { on = speaking; mark(uid, on); }
++      }, 150);
++      return () => { clearInterval(id); try { src.disconnect(); } catch (_) { /* already gone */ } mark(uid, false); };
++    } catch (_) { return () => {}; }
++  }
++
++  // ---------- peers ----------
++  const sig = (to, data) => { if (socket) socket.emit('voice:signal', { to, data }); };
++
++  function closePeer(uid) {
++    const p = st.peers.get(uid);
++    if (!p) return;
++    st.peers.delete(uid);
++    p.pc.onicecandidate = p.pc.ontrack = p.pc.onconnectionstatechange = null;
++    try { p.pc.close(); } catch (_) { /* ignore */ }
++    if (p.stopWatch) p.stopWatch();
++    if (p.audio) { p.audio.srcObject = null; p.audio.remove(); }
++  }
++  const closeAllPeers = () => { for (const uid of [...st.peers.keys()]) closePeer(uid); };
++
++  function resumeAudio() {
++    st.note = '';
++    for (const p of st.peers.values()) if (p.audio) p.audio.play().catch(() => {});
++    ui();
++  }
++
++  function makePeer(uid, initiator) {
++    closePeer(uid);
++    const pc = new RTCPeerConnection({ iceServers: st.ice });
++    const peer = { uid, pc, state: 'connecting', pending: [], chain: Promise.resolve(), audio: null, stopWatch: null };
++    st.peers.set(uid, peer);
++    if (st.stream) st.stream.getAudioTracks().forEach(t => pc.addTrack(t, st.stream));
++    else pc.addTransceiver('audio', { direction: 'recvonly' });          // listen-only
++    pc.onicecandidate = (e) => { if (e.candidate) sig(uid, { type: 'candidate', candidate: e.candidate.toJSON() }); };
++    pc.ontrack = (e) => {
++      const stream = e.streams[0] || new MediaStream([e.track]);
++      if (!peer.audio) { peer.audio = document.createElement('audio'); peer.audio.autoplay = true; peer.audio.playsInline = true; el('voiceAudio').append(peer.audio); }
++      peer.audio.srcObject = stream;
++      peer.audio.play().catch(() => { st.note = 'Click anywhere on the page to start the audio.'; ui(); document.addEventListener('click', resumeAudio, { once: true }); });
++      if (peer.stopWatch) peer.stopWatch();
++      peer.stopWatch = watch(stream, uid);
++    };
++    pc.onconnectionstatechange = () => { peer.state = pc.connectionState; ui(); };
++    if (initiator) {
++      peer.chain = peer.chain.then(async () => {
++        await pc.setLocalDescription(await pc.createOffer());
++        sig(uid, { type: 'offer', sdp: pc.localDescription.sdp });
++      }).catch(() => { peer.state = 'failed'; ui(); });
++    }
++    return peer;
++  }
++
++  function onSignal({ from, data }) {
++    if (!st.on || !data || typeof from !== 'string') return;
++    let peer = st.peers.get(from);
++    if (data.type === 'offer') peer = makePeer(from, false);             // a (re)joining player always starts a fresh connection
++    if (!peer) return;
++    peer.chain = peer.chain.then(async () => {
++      const pc = peer.pc;
++      const flush = async () => { for (const c of peer.pending.splice(0)) await pc.addIceCandidate(c).catch(() => {}); };
++      if (data.type === 'offer') {
++        await pc.setRemoteDescription({ type: 'offer', sdp: data.sdp });
++        await flush();
++        await pc.setLocalDescription(await pc.createAnswer());
++        sig(from, { type: 'answer', sdp: pc.localDescription.sdp });
++      } else if (data.type === 'answer') {
++        await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
++        await flush();
++      } else if (data.type === 'candidate' && data.candidate) {
++        if (pc.remoteDescription) await pc.addIceCandidate(data.candidate).catch(() => {});
++        else peer.pending.push(data.candidate);
++      }
++    }).catch((e) => { console.warn('voice signaling error:', e); peer.state = 'failed'; ui(); });
++  }
++
++  // ---------- session control ----------
++  function cleanup() {
++    st.on = false; st.joining = false;
++    closeAllPeers();
++    if (st.stream) st.stream.getTracks().forEach(t => t.stop());
++    if (st.stopLocal) st.stopLocal();
++    st.stream = null; st.stopLocal = null; st.noMic = false; st.muted = false; st.note = '';
++    st.speaking.clear(); applySpeaking();
++    ui();
++  }
++
++  async function enable() {
++    if (st.on || st.joining) return;
++    if (!G || !G.you) { toast('Join a game room first'); return ui(); }
++    if (!window.RTCPeerConnection) { toast('Your browser does not support voice chat.'); return ui(); }
++    st.joining = true; st.note = ''; ui();
++    try {
++      try { st.ice = (await api('/api/voice/config')).iceServers || []; } catch (e) { throw new Error('Could not load voice settings: ' + e.message); }
++      st.noMic = false; st.stream = null;
++      try {
++        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { const e = new Error('insecure'); e.name = 'SecurityError'; throw e; }
++        st.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
++        st.stopLocal = watch(st.stream, me.uid);
++      } catch (e) { st.noMic = true; st.note = micError(e); toast(st.note); }
++      st.muted = st.noMic;
++      const res = await send('voice:join', { muted: st.muted });
++      if (!res.ok) throw new Error(res.error);
++      st.on = true;
++      for (const p of res.peers) makePeer(p.uid, true);
++    } catch (e) { cleanup(); toast(e.message); return; }
++    finally { st.joining = false; }
++    ui();
++  }
++
++  async function rejoin() {                       // after a socket reconnect the server has dropped our session
++    if (!st.on || st.joining) return;
++    st.joining = true; ui();
++    try {
++      closeAllPeers();
++      const res = await send('voice:join', { muted: st.muted });
++      if (!res.ok) throw new Error(res.error);
++      for (const p of res.peers) makePeer(p.uid, true);
++    } catch (e) { cleanup(); toast('Voice chat disconnected: ' + e.message); }
++    finally { st.joining = false; ui(); }
++  }
++
++  function disable() {
++    const was = st.on || st.joining;
++    cleanup();
++    if (was && socket && socket.connected) socket.emit('voice:leave', {});
++  }
++
++  async function toggleMute() {
++    if (!st.on || st.noMic || !st.stream) return;
++    st.muted = !st.muted;
++    st.stream.getAudioTracks().forEach(t => { t.enabled = !st.muted; });
++    ui();
++    const r = await send('voice:mute', { muted: st.muted });
++    if (!r.ok) toast(r.error);
++  }
++
++  // ---------- hooks used by app.js ----------
++  function attach(sock) {
++    sock.on('voice:signal', onSignal);
++    sock.on('voice:peer-left', ({ uid }) => { closePeer(uid); ui(); });
++    sock.on('voice:kicked', ({ reason }) => { cleanup(); toast(reason || 'Voice chat ended'); });
++    sock.on('connect', () => { if (st.on) rejoin(); });
++  }
++  function onState() {
++    if (st.on && !st.joining && (!G || !G.you || (G.voice && !G.voice[me.uid]))) { cleanup(); toast('Voice chat ended'); return; }
++    ui(); applySpeaking();
++  }
++
++  el('voiceToggle').addEventListener('change', (e) => (e.target.checked ? enable() : disable()));
++  el('micBtn').addEventListener('click', toggleMute);
++  document.addEventListener('keydown', (e) => {   // M = mute / unmute
++    if (e.key.toLowerCase() !== 'm' || e.ctrlKey || e.metaKey || e.altKey) return;
++    if (/^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName)) return;
++    toggleMute();
++  });
++  window.addEventListener('pagehide', () => { if (st.on && socket) socket.emit('voice:leave', {}); });
++
++  return { attach, onState, reset: cleanup, _st: st };
++})();
++window.Voice = Voice;
+diff -ruN a/server.js b/server.js
+--- a/server.js	2026-10-17 12:01:16.991082234 +0000
++++ b/server.js	2026-10-17 12:02:46.812454962 +0000
+@@ -47,6 +47,7 @@
+   res.set({
+     'X-Content-Type-Options': 'nosniff',
+     'X-Frame-Options': 'DENY',
++    'Permissions-Policy': 'microphone=(self), camera=(), geolocation=()',
+     'Referrer-Policy': 'same-origin',
+     'Content-Security-Policy': "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+   });
+@@ -80,6 +81,20 @@
+ 
+ // ---------- REST ----------
+ app.get('/api/config', (req, res) => res.json({ premium: engine.PREMIUM, values: engine.VALUES, avatars: AVATARS }));
++// ---- voice chat: ICE (STUN/TURN) servers handed to authenticated players ----
++function voiceIceServers(uid) {
++  if (process.env.VOICE_ICE_SERVERS) {                      // full override, JSON array of RTCIceServer objects
++    try { const a = JSON.parse(process.env.VOICE_ICE_SERVERS); if (Array.isArray(a)) return a; } catch (_) { console.error('VOICE_ICE_SERVERS is not valid JSON'); }
++  }
++  const list = [{ urls: (process.env.VOICE_STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302').split(',').map(s => s.trim()).filter(Boolean) }];
++  if (process.env.VOICE_TURN_URLS && process.env.VOICE_TURN_SECRET) {   // coturn "use-auth-secret": short-lived credentials
++    const username = `${Math.floor(Date.now() / 1000) + 3600}:${uid}`;
++    list.push({ urls: process.env.VOICE_TURN_URLS.split(',').map(s => s.trim()).filter(Boolean), username,
++      credential: crypto.createHmac('sha1', process.env.VOICE_TURN_SECRET).update(username).digest('base64') });
++  }
++  return list;
++}
++app.get('/api/voice/config', auth, (req, res) => res.json({ iceServers: voiceIceServers(req.user.uid) }));
+ app.get('/api/vapid', (req, res) => res.json({ key: pushEnabled ? process.env.VAPID_PUBLIC_KEY : null }));
+ 
+ app.post('/api/register', limiter(10, 60000), wrap(async (req, res) => {
+@@ -187,6 +202,8 @@
+   return g;
+ }
+ function removeGame(g) {
++  for (const s of g.voice.values()) io.to(s.socketId).emit('voice:kicked', { reason: 'The room was closed' });
++  g.voice.clear();
+   g.destroy(); games.delete(g.id); byCode.delete(g.code);
+   for (const p of g.players) if (userGame.get(p.uid) === g) userGame.delete(p.uid);
+   io.to('spec:' + g.id).emit('room:left');
+@@ -199,9 +216,35 @@
+ }
+ const humanPlayer = async (user) => ({ uid: user.uid, name: user.name, userId: user.guest ? null : userIdOf(user.uid), rating: await ratingOf(user) });
+ 
++// ---- voice chat sessions (one per player per room; signaling only, audio flows peer-to-peer) ----
++function voiceLeave(g, uid, socketId) {
++  const s = g.voice.get(uid);
++  if (!s || (socketId && s.socketId !== socketId)) return;
++  g.voice.delete(uid);
++  for (const other of g.voice.values()) io.to(other.socketId).emit('voice:peer-left', { uid });
++  broadcast(g);
++}
++const VOICE_MAX_SDP = 16000;   // below the 20 KB socket buffer limit; an audio-only SDP is ~2-4 KB
++function cleanSignal(d) {      // forward only well-formed, size-capped fields
++  if (!d || typeof d !== 'object') return null;
++  if (d.type === 'offer' || d.type === 'answer') return typeof d.sdp === 'string' && d.sdp && d.sdp.length <= VOICE_MAX_SDP ? { type: d.type, sdp: d.sdp } : null;
++  if (d.type === 'candidate') {
++    const c = d.candidate;
++    if (!c || typeof c !== 'object' || typeof c.candidate !== 'string' || c.candidate.length > 1000) return null;
++    return { type: 'candidate', candidate: {
++      candidate: c.candidate,
++      sdpMid: typeof c.sdpMid === 'string' ? c.sdpMid.slice(0, 64) : null,
++      sdpMLineIndex: Number.isInteger(c.sdpMLineIndex) ? c.sdpMLineIndex : null,
++      usernameFragment: typeof c.usernameFragment === 'string' ? c.usernameFragment.slice(0, 64) : undefined,
++    } };
++  }
++  return null;
++}
++
+ function detach(uid) {  // leave any room the user is in (without side effects for running games)
+   const g = userGame.get(uid);
+   if (!g) return;
++  voiceLeave(g, uid);
+   if (g.status === 'waiting') {
+     userGame.delete(uid);
+     g.removePlayer(uid);
+@@ -432,6 +475,44 @@
+   handle('game:resign', async () => { myGame().resign(me.uid); });
+   handle('game:hint', async () => ({ moves: myGame().hint(me.uid) }));
+ 
++  // ---- voice chat: membership is checked on EVERY event against the server-side room, never against client claims ----
++  const sigTimes = [];
++  const voiceSession = () => {
++    const g = userGame.get(me.uid);
++    if (!g || !g.players.some(p => p.uid === me.uid)) throw new GameError('Voice chat is only available to players in this room');
++    return g;
++  };
++  const activeVoice = () => {
++    const g = voiceSession(), s = g.voice.get(me.uid);
++    if (!s || s.socketId !== socket.id) throw new GameError('You are not in the voice chat');
++    return { g, s };
++  };
++  handle('voice:join', async (o) => {
++    const g = voiceSession();
++    const old = g.voice.get(me.uid);
++    if (old && old.socketId !== socket.id) io.to(old.socketId).emit('voice:kicked', { reason: 'Voice chat was started from another tab' });
++    voiceLeave(g, me.uid);                       // replaces any previous session of this player
++    g.voice.set(me.uid, { socketId: socket.id, muted: !!o.muted });
++    const peers = [...g.voice].filter(([uid]) => uid !== me.uid)
++      .map(([uid, s]) => ({ uid, name: (g.players.find(p => p.uid === uid) || {}).name || '?', muted: s.muted }));
++    broadcast(g);
++    return { peers };
++  });
++  handle('voice:leave', async () => { const g = userGame.get(me.uid); if (g) voiceLeave(g, me.uid, socket.id); });
++  handle('voice:mute', async (o) => { const { g, s } = activeVoice(); s.muted = !!o.muted; broadcast(g); });
++  handle('voice:signal', async (o) => {
++    const { g } = activeVoice();
++    const now = Date.now();
++    while (sigTimes.length && now - sigTimes[0] > 10000) sigTimes.shift();
++    if (sigTimes.length >= 300) throw new GameError('Too many voice signals, slow down');
++    sigTimes.push(now);
++    const target = typeof o.to === 'string' && o.to !== me.uid ? g.voice.get(o.to) : null;
++    if (!target) throw new GameError('That player is not in the voice chat');
++    const data = cleanSignal(o.data);
++    if (!data) throw new GameError('Invalid voice signal');
++    io.to(target.socketId).emit('voice:signal', { from: me.uid, data });
++  });
++
+   handle('chat:send', async (o) => {
+     const now = Date.now();
+     if (now - lastChat < 500) throw new GameError('You are sending messages too fast');
+@@ -452,6 +533,8 @@
+   });
+ 
+   socket.on('disconnect', () => {
++    const vg = userGame.get(me.uid);
++    if (vg) voiceLeave(vg, me.uid, socket.id);   // only if THIS socket owned the voice session
+     if (!online(me.uid)) dequeue(me.uid);  // games keep running; the turn timer handles absent players
+   });
+ });
+diff -ruN a/src/game.js b/src/game.js
+--- a/src/game.js	2026-10-17 12:01:16.982217463 +0000
++++ b/src/game.js	2026-10-17 12:02:46.809463405 +0000
+@@ -28,6 +28,7 @@
+     this.history = [];
+     this.chat = [];
+     this.triviaLog = [];
++    this.voice = new Map();   // uid -> {socketId, muted}; managed by the server (voice chat sessions)
+     this.deadline = null;
+     this.timer = null;
+     this.aiTimer = null;
+@@ -258,6 +259,7 @@
+       history: this.history.slice(-60).map(h => ({ n: h.n, uid: h.uid, type: h.type, score: h.score, words: h.words, count: h.count })),
+       lastPlay: [...this.history].reverse().find(h => h.type === 'play')?.placements || [],
+       result: this.result,
++      voice: Object.fromEntries([...this.voice].map(([u, s]) => [u, s.muted ? 'muted' : 'live'])),   // absent = voice disabled
+     };
+   }
+ }

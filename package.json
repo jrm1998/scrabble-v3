@@ -1,0 +1,24 @@
+{
+  "name": "scrabble-online",
+  "version": "1.0.0",
+  "description": "Real-time multiplayer Scrabble PWA (Node.js, Socket.IO, MySQL)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "setup": "node scripts/setup-env.js",
+    "db:init": "node scripts/init-db.js",
+    "dict": "node scripts/fetch-dictionary.js",
+    "vapid": "node scripts/gen-vapid.js",
+    "test": "node tests/run.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.9.7",
+    "socket.io": "^4.7.5",
+    "web-push": "^3.6.7"
+  }
+}
